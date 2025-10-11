@@ -344,6 +344,29 @@ def printf(fmt, *args, file=sys.stdout):
     file.write(fmt)
     file.flush()
 
+def is_html(response):
+    """ Return True if the response is a HTML webpage """
+    return (
+        "Content-Type" in response.headers
+        and "text/html" in response.headers["Content-Type"]
+    )
+
+def is_safe_path(path):
+    """ Prevent directory traversal attacks """
+    # This is a simplified check for relative paths within the git repo context.
+    return ".." not in path.split(os.path.sep) and not os.path.isabs(path)
+
+def get_indexed_files(response):
+    """ Return all the files in the directory index webpage """
+    html = bs4.BeautifulSoup(response.text, "html.parser")
+    files = []
+    for link in html.find_all("a"):
+        href = link.get("href")
+        # Basic filtering for relative links, ignoring parent dir links, etc.
+        if href and not href.startswith(('?', '/', '..', 'http:', 'https:')):
+            files.append(href)
+    return files
+
 def verify_response(response):
     if response.status_code != 200:
         return (False, f"[-] %s/%s responded with status code {response.status_code}\n")
@@ -376,12 +399,14 @@ def get_referenced_sha1(obj_file):
 def sanitize_file(filepath):
     """Inplace comment out possibly unsafe lines based on regex."""
     if not os.path.isfile(filepath): return
+    UNSAFE = r"dumpping"
     UNSAFE = r"^\s*fsmonitor|sshcommand|askpass|editor|pager"
     with open(filepath, 'r+') as f:
         content = f.read()
         modified_content = re.sub(UNSAFE, r'# \g<0>', content, flags=re.IGNORECASE)
         if content != modified_content:
             printf("Warning: '%s' file was altered\n" % filepath)
+
             f.seek(0)
             f.write(modified_content)
             f.truncate()
@@ -468,6 +493,49 @@ class DownloadWorker(Worker):
                     f.write(chunk)
         return []
 
+class RecursiveDownloadWorker(DownloadWorker):
+    """Download a directory recursively."""
+
+    def do_task(self, filepath, url, directory, timeout, headers):
+        local_filepath = os.path.join('git_repo', filepath)
+        if os.path.isfile(os.path.join(directory, local_filepath)) and not filepath.endswith('/'):
+            printf("[-] Already downloaded %s/%s\n", url, filepath)
+            return []
+
+        # Ensure URL has a trailing slash for proper joining, but don't modify the base url arg
+        full_request_url = url.rstrip('/') + '/' + filepath.lstrip('/')
+
+        with self.session.get(full_request_url, stream=True, timeout=timeout) as response:
+            printf("[-] Fetching %s [%d]\n", full_request_url, response.status_code)
+
+            if (
+                response.status_code in (301, 302)
+                and "Location" in response.headers
+                and response.headers["Location"].endswith(filepath + "/")
+            ):
+                return [filepath + "/"]
+
+            # Treat empty filepath as a directory index as well
+            if filepath.endswith("/") or filepath == '':
+                if response.status_code == 200 and is_html(response):
+                    return [
+                        filepath + filename
+                        for filename in get_indexed_files(response)
+                    ]
+                return []
+            else:  # file
+                valid, error_message = verify_response(response)
+                if not valid:
+                    printf(error_message % (url, filepath), file=sys.stderr)
+                    return []
+
+                abspath = os.path.abspath(os.path.join(directory, local_filepath))
+                create_intermediate_dirs(abspath)
+                with open(abspath, "wb") as f:
+                    for chunk in response.iter_content(4096):
+                        f.write(chunk)
+                return []
+
 class FindRefsWorker(DownloadWorker):
     def do_task(self, filepath, url, directory, timeout, headers):
         response = self.session.get(f"{url}/{filepath}", timeout=timeout)
@@ -550,6 +618,32 @@ def download_git_repo(url, output_dir, jobs=10, timeout=10):
     valid, error_message = verify_response(response)
     if not valid or not re.match(r"^(ref:.*|[0-9a-f]{40}$)", response.text.strip()):
         printf(f"Error: {url}/HEAD is not a valid git HEAD file.\n", file=sys.stderr)
+        return
+
+    # Check for directory listing
+    dir_listing_url = url + '/'
+    printf("[-] Testing %s for directory listing ", dir_listing_url)
+    response = session.get(dir_listing_url, allow_redirects=False, timeout=timeout)
+    printf("[%d]\n", response.status_code)
+
+    # Handle 301 redirect to the same URL with a trailing slash
+    if response.status_code == 301 and response.headers.get("Location") == dir_listing_url:
+        printf("[-] Following redirect to %s ", dir_listing_url)
+        url = dir_listing_url  # CRITICAL FIX: Update the url variable
+        response = session.get(dir_listing_url, allow_redirects=False, timeout=timeout)
+        printf("[%d]\n", response.status_code)
+    elif response.status_code == 200 and not url.endswith('/'):
+        # Some servers might return 200 on a directory without a slash. Let's ensure we use the slashed version.
+        url += '/'
+
+    if (
+        response.status_code == 200
+        and is_html(response)
+        and "HEAD" in get_indexed_files(response)
+    ):
+        printf("[-] Directory listing detected. Fetching recursively...\n")
+        process_tasks([''], RecursiveDownloadWorker, jobs, args=(url, output_dir, timeout, headers))
+        printf("\n[*] Recursive download complete.\n")
         return
 
     # No directory listing support, directly to file fetching
